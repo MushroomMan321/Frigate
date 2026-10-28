@@ -16,6 +16,7 @@
 
 #include "app/message_log.h"
 #include "app/present.h"
+#include "app/record.h"
 #include "app/replay.h"
 #include "app/run_dir.h"
 #include "app/sound_trace.h"
@@ -34,6 +35,7 @@
 #include "hal/rom/port_rom.h"
 #include "hal/rom/rom_manifest.h"
 #include "hal/rtc/rtc_host.h"
+#include "hal/tp/tp_host.h"
 #include "hal/trap.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -78,6 +80,13 @@ static const Option sOptions[] = {
       "plays the buttons, lid and touch of an input file instead of the window's (port/app/replay.h); its time line "
       "(or the format's default) sets the clock unless --fixed-time is given, and its clock line can pin the clock "
       "there for the whole run" },
+    { "record", "FILE", 0,
+      "writes the buttons, lid and touch the game is given to a new input file, on video frames, which --input replays "
+      "to the same frames on the same ROM and starting saves (port/app/record.h). From the window, the clock starts at "
+      "--fixed-time or the host's time then and runs with the game's, and the game gets 64 seeds drawn from the host; "
+      "with --input, the clock and the seeds are the file's, which must declare its seeds. A file that exists or "
+      "can't be made is a bad option (status 2); a write that fails, or the game asking for a seed past the "
+      "recording's, stops the run with status 1" },
     { "rom", "PATH", 0, "the player's ROM (port/hal/rom)" },
     { "save-dir", "PATH", 0, "where saves go (port/hal/card)" },
     { "fixed-time", "\"YYYY-MM-DD HH:MM:SS\"", 0,
@@ -129,8 +138,9 @@ static const ExitStatus sExitStatuses[] = {
     { 0, "the run ended normally" },
     { 1, "it can't go on or didn't do what it was asked, each cause with a \"port:\" line: the window didn't open, a "
          "write to the run directory failed during the run (a frame's row in frames.tsv, a screen's PNG file or "
-         "memory.txt, which stops the run at once), a write to the sound trace or of --frame-times' file failed, a "
-         "module ran out of host memory (an arena, the geometry engine or its command log, the files over memory) or "
+         "memory.txt, which stops the run at once), a write to the sound trace, of --frame-times' file or to "
+         "--record's file failed, the game asked for a random seed that --record's file doesn't declare, a module "
+         "ran out of host memory (an arena, the geometry engine or its command log, the files over memory) or "
          "found a build that can't work (no overlay sections, an archive or a file over memory read through an "
          "address cut to 32 bits)" },
     { EXIT_BAD_OPTIONS, "bad options, among them a run directory, WAV dump or sound trace that can't be opened" },
@@ -158,7 +168,12 @@ static unsigned long sFrames;
 static const char *sScreenshotPath;
 static int sScreenshotWritten;
 static int sRunDirFailed;
+static int sRecordFailed;
 static int sWindowOpen;
+// A recording's clock at power-on, "YYYY-MM-DD HH:MM:SS" (NULL without --record), and a live one's seeds
+static const char *sRecordTime;
+static char sRecordHostTime[20];
+static uint64_t sRecordSeeds[PORT_RECORD_LIVE_SEEDS];
 // Pacing: the host time of the first paced frame, and the frames since
 static Uint64 sPaceStartNs;
 static Uint64 sPacedFrames;
@@ -374,7 +389,10 @@ static int OpenRunDir(const char *dir, const char *inputPath) {
 
     info.program = program != NULL ? program + 1 : sArgv[0];
     info.rom = rom != NULL ? rom : port_rom_default_path();
-    info.time = time != NULL ? time : inputPath != NULL ? port_replay_time() : "host";
+    info.time = time != NULL          ? time
+                : inputPath != NULL   ? port_replay_time()
+                : sRecordTime != NULL ? sRecordTime
+                                      : "host";
     info.input = inputPath;
     info.inputFrames = port_replay_frames();
     info.frames = (uint32_t)sFrameLimit;
@@ -409,6 +427,95 @@ static int AddRunDumps(void) {
     return 1;
 }
 
+// The game asked for a random seed past the ones --record's file declares: the run stops before the seed it built
+// reaches the game, with the file and the run directory as they are (port/hal/gfl/random_seed.h). It comes from the
+// game's own call, on its fiber, so it ends the process as a trap does
+static void RecordSeedsExhausted(size_t taken) {
+    port_record_stop_at_seed(taken);
+    port_run_dir_close(1);
+    if (port_app_fatal_notice != NULL) {
+        port_app_fatal_notice("The recording stopped: the game asked for a random seed the recording doesn't declare. "
+                              "The input up to now is in the file.");
+    }
+    fflush(stderr);
+    _Exit(1);
+}
+
+// Opens --record's file (port/app/record.h) with the run's effective start: the clock's time, --fixed-time's, else the
+// input file's (port/app/replay.c has set the clock to it), else the host's local time now, which the clock then
+// starts from and runs on with the game's as --fixed-time's does; the clock pinned only by an input file; and the
+// seeds, an input file's own, which it must declare, else 64 drawn from the host, given to the game here. The game
+// never gets a seed the file doesn't declare
+static int OpenRecording(const char *path, const char *inputPath) {
+    const char *program = strrchr(sArgv[0], '/');
+    const char *fixedTime = port_app_option("fixed-time");
+    PortRecordStart start;
+
+    start.program = program != NULL ? program + 1 : sArgv[0];
+    start.version = PORT_VERSION_NAME;
+    start.pinned = port_replay_clock_pinned();
+    start.input = inputPath;
+    if (fixedTime != NULL) {
+        sRecordTime = fixedTime;
+    } else if (inputPath != NULL) {
+        sRecordTime = port_replay_time();
+    } else {
+        PortRtcTime now;
+
+        port_rtc_now(&now);
+        snprintf(sRecordHostTime, sizeof(sRecordHostTime), "%04d-%02d-%02d %02d:%02d:%02d", now.year, now.month,
+                 now.day, now.hour, now.minute, now.second);
+        if (!port_rtc_set_fixed_time(sRecordHostTime)) {
+            fprintf(stderr, "port: --record %s: the host's time %s isn't a time the clock can hold\n", path,
+                    sRecordHostTime);
+            return 0;
+        }
+        sRecordTime = sRecordHostTime;
+    }
+    start.time = sRecordTime;
+    if (inputPath != NULL) {
+        start.seedCount = port_replay_seeds(&start.seeds);
+        if (start.seedCount == 0) {
+            fprintf(stderr,
+                    "port: --record %s: --input %s declares no seeds (\"seed\" lines), so the game would build its "
+                    "own, which a recording can't hold\n",
+                    path, inputPath);
+            return 0;
+        }
+    } else {
+        if (!port_record_draw_seeds(sRecordSeeds, PORT_RECORD_LIVE_SEEDS)) {
+            return 0;
+        }
+        port_random_seed_give(sRecordSeeds, PORT_RECORD_LIVE_SEEDS);
+        start.seeds = sRecordSeeds;
+        start.seedCount = PORT_RECORD_LIVE_SEEDS;
+    }
+    if (!port_record_open(path, &start)) {
+        return 0;
+    }
+    port_random_seed_set_exhausted(RecordSeedsExhausted);
+    return 1;
+}
+
+// The frame's state for --record, as the game is given it after the window's input or the replay's: what the game's
+// next pass reads, and what the ARM7's touch service samples at the frame's VBlank (port/hal/tp). A live recording's
+// first VBlank keeps power-on's state, nothing held, since a file's frame 1 holds from power-on too
+static void RecordFrame(void) {
+    int touching;
+    int x;
+    int y;
+
+    if (sFrames == 1 && !port_replay_active()) {
+        port_input_set(0, 0);
+        port_tp_set_touch(0, 0, 0);
+    }
+    port_tp_get_touch(&touching, &x, &y);
+    if (!port_record_vblank((uint32_t)sFrames, port_input_held(), port_input_closed(), touching, x, y)) {
+        sRecordFailed = 1;
+        port_os_stop();
+    }
+}
+
 // The program's frame hook, at each VBlank on the dispatcher's stack: the scanline hook has drawn the frame's 192
 // lines by now. The input taken here is what the game's VBlank work and next frame read
 static void AppFrame(void) {
@@ -422,6 +529,9 @@ static void AppFrame(void) {
     port_frame_time_end(PORT_FRAME_TIME_PRESENT, begin);
     // The game clock, and a replay's input in place of what the window took
     port_replay_vblank((uint32_t)sFrames);
+    if (port_record_active() && !sRecordFailed) {
+        RecordFrame();
+    }
     if (port_run_dir_active()) {
         RunDirFrame();
     }
@@ -453,6 +563,7 @@ int main(int argc, char **argv) {
     const char *soundTrace;
     const char *frameTimes;
     const char *inputPath;
+    const char *recordPath;
     const uint64_t *seeds;
     size_t seedCount;
     const char *runDir;
@@ -542,15 +653,26 @@ int main(int argc, char **argv) {
         seedCount = port_replay_seeds(&seeds);
         port_random_seed_give(seeds, seedCount);
     }
+    recordPath = port_app_option("record");
+    if (recordPath != NULL && *recordPath == '\0') {
+        fprintf(stderr, "port: --record needs a file\n");
+        Usage();
+        return EXIT_BAD_OPTIONS;
+    }
+    if (recordPath != NULL && !OpenRecording(recordPath, inputPath)) {
+        return EXIT_BAD_OPTIONS;
+    }
     runDir = port_app_option("run-dir");
     if ((runDir != NULL && *runDir == '\0') ||
         (runDir == NULL && (port_app_option("run-screens") != NULL || port_app_option("run-dump") != NULL))) {
         fprintf(stderr, "port: --run-dir needs a directory, and --run-screens and --run-dump need --run-dir\n");
         Usage();
+        port_record_discard();
         return EXIT_BAD_OPTIONS;
     }
     if (runDir != NULL && (!OpenRunDir(runDir, inputPath) || !AddRunDumps())) {
         port_run_dir_close(EXIT_BAD_OPTIONS);
+        port_record_discard();
         return EXIT_BAD_OPTIONS;
     }
     if (arenaSize != 0) {
@@ -566,6 +688,7 @@ int main(int argc, char **argv) {
     port_workers_start((int)renderThreads);
     if (!sHeadless) {
         if (!port_present_open()) {
+            port_record_discard();
             return 1;
         }
         sWindowOpen = 1;
@@ -580,6 +703,7 @@ int main(int argc, char **argv) {
         if (sWindowOpen) {
             port_present_close();
         }
+        port_record_discard();
         return EXIT_BAD_OPTIONS;
     }
     if (soundTrace != NULL && !port_sound_trace_open(soundTrace)) {
@@ -587,6 +711,7 @@ int main(int argc, char **argv) {
         if (sWindowOpen) {
             port_present_close();
         }
+        port_record_discard();
         return EXIT_BAD_OPTIONS;
     }
     // Nothing pressed, the lid open and the pen up, as the game's first reads must see, or a replay's first frame; then
@@ -594,6 +719,17 @@ int main(int argc, char **argv) {
     port_input_set(0, 0);
     if (port_replay_active()) {
         port_replay_start();
+    }
+    // That state, which a recording's frame 1 gives from power-on
+    if (port_record_active()) {
+        int touching;
+        int x;
+        int y;
+
+        port_tp_get_touch(&touching, &x, &y);
+        if (!port_record_start(port_input_held(), port_input_closed(), touching, x, y)) {
+            sRecordFailed = 1;
+        }
     }
     port_screens_attach();
     // The geometry engine at power-on, now that the I/O registers exist, its readback registers, and its swap at each
@@ -633,6 +769,10 @@ int main(int argc, char **argv) {
     }
     // --frame-times' file, written now that the run is over
     if (!port_frame_time_close()) {
+        status = 1;
+    }
+    // --record's file, whose lines are all written: a write that failed or a sample it refused fails the run
+    if (!port_record_close() || sRecordFailed) {
         status = 1;
     }
     port_run_dir_close(status);

@@ -282,16 +282,17 @@ seed 0xea56a175a2fffc8a       # optional, repeated: the random seeds the DS buil
   to 191.
 - Columns are separated by spaces or tabs; lines may end with CR LF. Anything else is an error that names the line.
 
-### Recordings (proposed; not implemented)
+### Recordings
 
-`--record FILE` is not an available option yet. This is the contract for the implementation tracked in issue #38.
-A recording targets reproducible native input on a compatible build, with the same ROM and starting save directory.
-It does not promise that a CPU-time-dependent trainer battle follows the DS's course (ADR 0023), or that unrelated
-builds reproduce the same game behavior.
+`--record FILE` writes the input a run gives the game as an input file that `--input FILE` replays to the same frames
+([port/app/record.c](../../app/record.c), issue #38). A recording targets reproducible native input on a compatible
+build, with the same ROM and starting save directory. It does not promise that a CPU-time-dependent trainer battle
+follows the DS's course (ADR 0023), or that unrelated builds reproduce the same game behavior.
 
 ```
 pbwinput 1
-# Recorded by Frigate: frigate-black2 <commit>, ROM <the dump's SHA-1>
+# Recorded by Frigate: frigate-black2, from the window's input
+# --input replays it on the same ROM, from the same starting saves, on a compatible build
 version b2_us
 frames video
 time 2026-10-25 14:03:27      # the effective RTC at power-on
@@ -300,6 +301,8 @@ seed 0x...                    # bounded seed list, before the first frame
 # FRAME BUTTONS [TOUCH]
 ...
 ```
+
+The contract below was reviewed before the code; the notes after it say how the program meets it.
 
 - **Effective input, on video frames.** At the VBlank hook, capture the held buttons, lid and pen state after window
   input/replay application, at the same boundary playback uses before ARM7 touch sampling. Write the corresponding
@@ -331,8 +334,41 @@ seed 0x...                    # bounded seed list, before the first frame
 Acceptance tests for the later implementation: both-version seeded record/replay routes compare frame/state and save
 hashes; one-VBlank touch transitions in a two-VBlank game pass preserve what the actual touch API returns; game/video
 input domains and effective RTC overrides round-trip; initial/unchanged/lid states, seed-list rejection/exhaustion,
-clean exit, crash prefixes, unwritable paths and mid-run write failures have focused regressions. Those tests and the
-option itself are not added by this documentation change. Issue #38 remains open until they are implemented and pass.
+clean exit, crash prefixes, unwritable paths and mid-run write failures have focused regressions.
+
+How the program meets it:
+
+- **Where the state is taken.** The program's frame hook (`port/app/main.c`) takes the buttons and lid
+  (`port_input_held`, `port_input_closed`) and the pen (`port_tp_get_touch`) after the window's input and the replay's
+  frame, before the ARM7's touch service samples the frame, and writes the hook's video frame. A line is written whole
+  and flushed when the state changes, and only then. Frame 1's state holds from power-on in a file, so the state at
+  VBlank 1 must be the state at power-on: a replay gives the same frame to both, and a live recording keeps power-on's
+  (nothing held) at its first VBlank, so the window's input reaches the game from the second.
+- **The clock.** `time` is `--fixed-time`'s, else the input file's (or the format's default), else the host's local
+  time when the option is read, which the clock is then fixed at and runs on from with the virtual clock. `clock
+  pinned` comes only from an input file that pins it.
+- **The seeds.** A live recording draws 64 from the host's random source (`port_host_random_bytes`, getentropy or
+  RtlGenRandom) and gives them to the game as a file's are; a replay's are its file's, and a file without `seed` lines
+  is refused (status 2). The first request past them calls the program's handler (`port_random_seed_set_exhausted`),
+  which says so, closes the file and the run directory (`run.txt` with status 1) and ends the program with status 1,
+  before the game builds a seed of its own. `run.txt` lists every seed as `given`.
+- **The destination.** The file is created with C11's exclusive mode (`"wbx"`, binary so that its lines end in LF on
+  every host): one that exists, whichever file it is (the input file, a save, an earlier recording), is refused with
+  status 2, and so is one that can't be made. A bad option found after it, before the game starts, removes the file
+  again. A write or flush that fails stops the run with status 1 at the end of that frame, the file ending at its last
+  complete line.
+
+The tests: `replay_record_first_save` (video frames, the pen, New Game's save), `replay_record_title` (game frames,
+`--fixed-time` given to the recorded run only), `replay_record_title_pinned` and `replay_record_live` (the host's time
+and 64 seeds), each in both versions' builds, run `port/tests/replay/check_record.py`: the recorded run and the
+replay of its recording must give the same `frames.tsv`, the same clock and seeds in `run.txt` and the same save files,
+and a recording of the replay must say what the first recording says. `pxi_tp_recorded_vblanks` drives the ARM9's
+touch library (`lib/nitro/src/spi/tp.c`) against the host's ARM7 with the pen down for one VBlank of a two-VBlank pass,
+recorded and played back: the auto sampling's latest sample and the pass's eight are the same in both.
+`app_record_plain` and `app_record_sanitized` test the recorder alone: the header, a line a change, power-on's state,
+the lid, the file after each sample (a killed run's prefix), a write that fails partway, a file that exists or can't be
+made, and the file removed for a run that never starts; `app_record_seeds_exhausted_*` the stop at a seed past the
+declared ones; `app_record_refuses_*` the program's option errors.
 
 ## Run directories
 
@@ -1168,6 +1204,9 @@ What the port needs to compare itself frame by frame:
   (2012-10-07 12:00:00), never the host's, and it stays there for the run when the file's `clock` line pins it;
   `oracle.py port --input` passes `--fixed-time` only when it is given `--time`, as `oracle.py run` does with the
   oracle.
+- **Recordings** (done: `--record FILE`, `port/app/record.c`, [above](#recordings)): a run's input, the window's or a
+  replay's, written as an input file on video frames with the run's clock and seeds, which `--input` replays to the
+  same frames.
 - **Memory dumps** by name, written as `memory.txt` (done for globals: `--run-dump`, `oracle.py port --dump`). The
   game's statics have no name the program can look up: a static the comparisons need gets a global holding its
   address in the host file its decomp file is compiled through, read with `**` (GFL's random state's two,

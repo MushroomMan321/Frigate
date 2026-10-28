@@ -2,17 +2,18 @@
 // Windows differ: memory pages and their protection, faults (a trap placeholder touched, a fiber's stack overflowing
 // into its guard, a crash), backtraces and the names of the program's functions and globals, the watchdog that stops a
 // frame which never ends, the monotonic clock that times the frames, the 3D renderer's threads and the signals they
-// wait on, writes to stderr that take no lock, directories, the environment and the program's static data. It touches
-// no part of the game itself: it is what the code above it stands on, so that trap.c, fiber.c and the tests are the
-// same on every host (port/docs/adr/0013). A module whose own feature is a host's keeps its branches instead (the
-// saves' folder and files in port/hal/card/backup.c, the VRAM's aliasing in port/hal/gx/vram_os.c, the mapped ROM in
-// port/hal/rom/rom.c, the overlays' sections by object format in port/hal/fs/ovsec.c, the RTC's local time, the macOS
-// app's log, the window's icon); port/hal/README.md lists them. Each host's half is one file, chosen by the compiler:
-// host_posix.c for macOS and Linux, host_windows.c for Windows; the other compiles to nothing. Its users:
-// port/hal/trap.c (traps and crashes), port/hal/os/fiber.c (the fibers' stacks and guards), port/hal/pxi/pointer.c (the
-// static data), port/hal/os/os_terminate.c (backtraces), port/hal/gx (the page size), port/hal/os/frame_time.c (the
-// clock), port/gfx/workers.c (the 3D renderer's threads and signals), port/app/main.c (the watchdog, --run-dump's
-// globals, the game's thread's class), port/app/run_dir.c, and the tests' harnesses. Plain C types only.
+// wait on, writes to stderr that take no lock, directories, the environment, the program's static data and the
+// system's random bytes. It touches no part of the game itself: it is what the code above it stands on, so that
+// trap.c, fiber.c and the tests are the same on every host (port/docs/adr/0013). A module whose own feature is a host's
+// keeps its branches instead (the saves' folder and files in port/hal/card/backup.c, the VRAM's aliasing in
+// port/hal/gx/vram_os.c, the mapped ROM in port/hal/rom/rom.c, the overlays' sections by object format in
+// port/hal/fs/ovsec.c, the RTC's local time, the macOS app's log, the window's icon); port/hal/README.md lists them.
+// Each host's half is one file, chosen by the compiler: host_posix.c for macOS and Linux, host_windows.c for Windows;
+// the other compiles to nothing. Its users: port/hal/trap.c (traps and crashes), port/hal/os/fiber.c (the fibers'
+// stacks and guards), port/hal/pxi/pointer.c (the static data), port/hal/os/os_terminate.c (backtraces), port/hal/gx
+// (the page size), port/hal/os/frame_time.c (the clock), port/gfx/workers.c (the 3D renderer's threads and signals),
+// port/app/main.c (the watchdog, --run-dump's globals, the game's thread's class), port/app/run_dir.c,
+// port/app/record.c (a live recording's seeds), and the tests' harnesses. Plain C types only.
 //
 // On Windows, every program that links host_windows.c also gets, before main(): stdout and stderr in binary mode, no
 // error dialog on a crash or abort(), and both exception handlers, which report the crashes nobody handles (see
@@ -189,5 +190,11 @@ int port_host_is_symbolic_link(const char *path);
 
 // The directory for the tests' temporary files: TMPDIR, else /tmp; the user's temporary folder on Windows
 const char *port_host_temporary_directory(void);
+
+// --- Random bytes ---------------------------------------------------------------------------------------------------
+
+// Fills buffer with size bytes from the system's random source (getentropy on macOS and Linux, rand_s on Windows), for
+// what must differ from run to run: a live recording's seeds. Returns 0 when the system gives none
+int port_host_random_bytes(void *buffer, size_t size);
 
 #endif // PORT_HAL_HOST_HOST_H

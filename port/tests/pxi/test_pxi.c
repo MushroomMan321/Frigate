@@ -1,12 +1,14 @@
 // Tests of the PXI bus and the host ARM7's services (port/hal/pxi and the services beside it). Each scenario runs as
 // the game's main() would, as the DS's launcher thread on the OS core, and drives the decomp's own ARM9 libraries
 // (pm.c, tp.c, nvram.c, os_reset.c, ctrdg.c, the SND commands) and the host's RTC and MIC APIs against the host's
-// ARM7, checking each protocol's answers and what the ARM7 leaves in the shared memory.
+// ARM7, checking each protocol's answers and what the ARM7 leaves in the shared memory. One also records the touch
+// with the program's recorder (port/app/record.c) and plays it back, as --record and --input do.
 //
 //   port_pxi_tests NAME
 //
 // One scenario a process, since the libraries start once (PM_Init and the like do nothing the second time).
 // PORT_PXI_VERBOSE prints each scenario's log.
+#include "app/record.h"
 #include "hal/host/host.h"
 #include "hal/nvram/nvram_settings.h"
 #include "hal/os/port_os.h"
@@ -25,6 +27,7 @@
 #include "nitro/snd.h"
 #include "nitro/svc.h"
 #include "nitro/tp.h"
+#include "tools/oracle/pbwinput.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -495,6 +498,120 @@ static void TestTpAutoSampling(void) {
     index = TP_GetLatestIndexInAuto();
     WaitFrames(2);
     CHECK(TP_GetLatestIndexInAuto() == index);
+}
+
+// A recording's touch, played back (port/app/record.c, --record; port/tools/oracle/README.md, "Recordings"): GFL
+// reads the touch panel once a pass (src/gfl/touchpanel.c), and at 30 frames a second a pass takes two VBlanks, whose
+// auto sampling it reads through the latest sample. The pen is down for a single VBlank of a pass (the first, then the
+// second), moves within one, and is released, as a player can do. The program records the pen at each VBlank, after
+// the window's input, as the ARM7 samples it next; --input plays the file back by video frame. Both runs must leave
+// the game the same samples at the end of every pass: the latest one, which sees a release, and the pass's eight
+#define TP_RECORDED_VBLANKS 16
+#define TP_RECORDED_PASS_SAMPLES 8
+
+typedef struct TpPassRead {
+    TPData latest;
+    TPData samples[TP_RECORDED_PASS_SAMPLES];
+} TpPassRead;
+
+// The touch at VBlank 1 to TP_RECORDED_VBLANKS: down, x, y
+static const int sRecordedTouch[TP_RECORDED_VBLANKS][3] = {
+    { 0, 0, 0 }, { 0, 0, 0 }, { 1, 10, 20 },   { 0, 0, 0 }, { 0, 0, 0 }, { 1, 100, 50 }, { 1, 100, 50 }, { 1, 101, 50 },
+    { 0, 0, 0 }, { 0, 0, 0 }, { 1, 200, 150 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 },    { 0, 0, 0 },    { 0, 0, 0 },
+};
+
+static TPData sRecordedSamples[9];
+
+// The end of a pass, as GFL reads it: the latest sample, and the pass's samples from the latest back
+static void ReadPass(TpPassRead *read) {
+    u16 latest = TP_GetLatestIndexInAuto();
+    int i;
+
+    TP_GetLatestRawPointInAuto(&read->latest);
+    for (i = 0; i < TP_RECORDED_PASS_SAMPLES; i++) {
+        read->samples[i] = sRecordedSamples[(latest + NELEMS(sRecordedSamples) - i) % NELEMS(sRecordedSamples)];
+    }
+}
+
+static int SameTp(const TPData *a, const TPData *b) {
+    return a->x == b->x && a->y == b->y && a->touch == b->touch && a->validity == b->validity;
+}
+
+static void TestTpRecordedVBlanks(void) {
+    static TpPassRead sLive[TP_RECORDED_VBLANKS / 2];
+    static TpPassRead sReplayed[TP_RECORDED_VBLANKS / 2];
+    static const uint64_t sSeed = 1;
+    char path[600];
+    char error[256];
+    PortRecordStart start;
+    PbwInput input;
+    int touching;
+    int x;
+    int y;
+    int vblank;
+    int pass;
+    int i;
+
+    // A name of its own, so that the plain and the sanitized builds can run it at once
+    snprintf(path, sizeof(path), "%s/pxi_tp_recorded_%llu.pbwinput", port_host_temporary_directory(),
+             (unsigned long long)port_host_now_ns());
+    Boot();
+    TP_Init();
+    port_tp_set_touch(0, 0, 0);
+    TP_RequestAutoSamplingStartAsync(0, 4, sRecordedSamples, NELEMS(sRecordedSamples));
+    TP_WaitBusy(TP_REQUEST_COMMAND_FLAG_AUTO_ON);
+    CHECK(TP_CheckError(TP_REQUEST_COMMAND_FLAG_AUTO_ON) == 0);
+
+    start.program = "port_pxi_tests";
+    start.version = "b2_us";
+    start.time = "2012-10-07 12:00:00";
+    start.pinned = 0;
+    start.input = NULL;
+    start.seeds = &sSeed;
+    start.seedCount = 1;
+    CHECK(port_record_open(path, &start));
+    CHECK(port_record_start(0, 0, 0, 0, 0));
+    for (vblank = 1; vblank <= TP_RECORDED_VBLANKS; vblank++) {
+        port_tp_set_touch(sRecordedTouch[vblank - 1][0], sRecordedTouch[vblank - 1][1], sRecordedTouch[vblank - 1][2]);
+        port_tp_get_touch(&touching, &x, &y);
+        CHECK(port_record_vblank((u32)vblank, 0, 0, touching, x, y));
+        WaitFrames(1);
+        if (vblank % 2 == 0) {
+            ReadPass(&sLive[vblank / 2 - 1]);
+        }
+    }
+    CHECK(port_record_close());
+
+    // The pass with the pen down for its first VBlank alone: its latest sample is the release, its others the touch
+    CHECK(sLive[1].latest.touch == 0 && sLive[1].samples[TP_RECORDED_PASS_SAMPLES - 1].touch == 1);
+
+    CHECK(pbw_input_load(&input, path, error, sizeof(error)));
+    // A line for each change: down at 3 and up at 4, down at 6, moved at 8, up at 9, down at 11 and up at 12
+    CHECK(input.frames == PBW_INPUT_VIDEO_FRAMES && input.count == 7);
+    for (vblank = 1; vblank <= TP_RECORDED_VBLANKS; vblank++) {
+        PbwInputState state = pbw_input_state(&input, (uint32_t)vblank);
+
+        port_tp_set_touch(state.touching, state.touchX, state.touchY);
+        WaitFrames(1);
+        if (vblank % 2 == 0) {
+            ReadPass(&sReplayed[vblank / 2 - 1]);
+        }
+    }
+    pbw_input_free(&input);
+    remove(path);
+    for (pass = 0; pass < TP_RECORDED_VBLANKS / 2; pass++) {
+        int same = SameTp(&sLive[pass].latest, &sReplayed[pass].latest);
+
+        for (i = 0; i < TP_RECORDED_PASS_SAMPLES; i++) {
+            same = same && SameTp(&sLive[pass].samples[i], &sReplayed[pass].samples[i]);
+        }
+        if (!same) {
+            Log("pass %d: the replay's samples differ from the recorded run's", pass + 1);
+        }
+        CHECK(same);
+    }
+    TP_RequestAutoSamplingStopAsync();
+    TP_WaitBusy(TP_REQUEST_COMMAND_FLAG_AUTO_OFF);
 }
 
 // The firmware's user settings and the NVRAM
@@ -1075,6 +1192,7 @@ static const Test sTests[] = {
     { "tp_sampling", TestTpSampling },
     { "tp_calibration", TestTpCalibration },
     { "tp_auto_sampling", TestTpAutoSampling },
+    { "tp_recorded_vblanks", TestTpRecordedVBlanks },
     { "nvram_user_info", TestNvramUserInfo },
     { "nvram_read", TestNvramRead },
     { "nvram_write", TestNvramWrite },

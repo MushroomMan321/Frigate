@@ -2,7 +2,8 @@
 // SIGBUS and the processor's other crashes as SIGFPE, SIGILL and SIGTRAP, on an alternate signal stack, backtraces
 // through execinfo, names through dladdr, the watchdog as SIGALRM, the program's static data and globals from its own
 // image (Mach-O's __DATA segment and export trie, ELF's linker symbols and symbol table), the monotonic clock, and the
-// renderer's threads (pthreads, at macOS's user-interactive QoS) with their signals (a mutex and a condition variable).
+// renderer's threads (pthreads, at macOS's user-interactive QoS) with their signals (a mutex and a condition variable),
+// and the system's random bytes (getentropy).
 // It touches no part of the game: the trap placeholders (port/hal/trap.c), the crash reports, the fibers' guards
 // (port/hal/os/fiber.c), the PXI pointers into static data (port/hal/pxi/pointer.c), --run-dump's globals
 // (port/app/main.c), the watchdog (port/app/main.c), --frame-times' clock (port/hal/os/frame_time.c) and the 3D
@@ -24,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -559,6 +561,24 @@ const char *port_host_temporary_directory(void) {
     const char *dir = getenv("TMPDIR");
 
     return dir != NULL ? dir : "/tmp";
+}
+
+// --- Random bytes ---------------------------------------------------------------------------------------------------
+
+int port_host_random_bytes(void *buffer, size_t size) {
+    unsigned char *at = buffer;
+
+    // getentropy gives at most 256 bytes a call
+    while (size != 0) {
+        size_t part = size < 256 ? size : 256;
+
+        if (getentropy(at, part) != 0) {
+            return 0;
+        }
+        at += part;
+        size -= part;
+    }
+    return 1;
 }
 
 #endif // !_WIN32

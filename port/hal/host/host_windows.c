@@ -3,13 +3,14 @@
 // unhandled-exception filter, backtraces by unwinding the x64 stack with the image's unwind tables, the names of the
 // program's functions and globals from the COFF symbol table that lld keeps in an unstripped MinGW program, the
 // watchdog as a thread, the program's static data from the PE image's writable sections, the performance counter as the
-// monotonic clock, and the renderer's threads with their signals (a slim reader/writer lock and a condition variable).
-// It also sets up every program that links it before main(): stdout and stderr in binary mode, so that "\n" stays "\n"
-// as on macOS and Linux; no error dialog on a crash or abort(), which would hold a test or a CI run forever; and both
-// exception handlers. It touches no part of the game: the trap placeholders (port/hal/trap.c), the fibers' guards
-// (port/hal/os/fiber.c), the PXI pointers into static data (port/hal/pxi/pointer.c), --run-dump's globals
-// (port/app/main.c), the watchdog (port/app/main.c), --frame-times' clock (port/hal/os/frame_time.c) and the 3D
-// renderer's workers (port/gfx/workers.c) stand on it. macOS and Linux have host_posix.c instead (port/docs/adr/0013).
+// monotonic clock, the renderer's threads with their signals (a slim reader/writer lock and a condition variable), and
+// the system's random bytes (RtlGenRandom, which rand_s uses). It also sets up every program that links it before
+// main(): stdout and stderr in binary mode, so that "\n" stays "\n" as on macOS and Linux; no error dialog on a crash
+// or abort(), which would hold a test or a CI run forever; and both exception handlers. It touches no part of the game:
+// the trap placeholders (port/hal/trap.c), the fibers' guards (port/hal/os/fiber.c), the PXI pointers into static data
+// (port/hal/pxi/pointer.c), --run-dump's globals (port/app/main.c), the watchdog (port/app/main.c), --frame-times'
+// clock (port/hal/os/frame_time.c) and the 3D renderer's workers (port/gfx/workers.c) stand on it. macOS and Linux have
+// host_posix.c instead (port/docs/adr/0013).
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
@@ -846,6 +847,27 @@ const char *port_host_temporary_directory(void) {
         }
     }
     return dir;
+}
+
+// --- Random bytes ---------------------------------------------------------------------------------------------------
+
+// RtlGenRandom, advapi32's SystemFunction036, which MinGW links by default: the source rand_s draws from, declared here
+// because rand_s needs _CRT_RAND_S before any header, and the force-included port_host.h can come first
+BOOLEAN NTAPI SystemFunction036(PVOID buffer, ULONG length);
+
+int port_host_random_bytes(void *buffer, size_t size) {
+    unsigned char *at = buffer;
+
+    while (size != 0) {
+        ULONG part = size < 0x10000 ? (ULONG)size : 0x10000;
+
+        if (!SystemFunction036(at, part)) {
+            return 0;
+        }
+        at += part;
+        size -= part;
+    }
+    return 1;
 }
 
 #endif // _WIN32

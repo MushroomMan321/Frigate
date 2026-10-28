@@ -4,7 +4,8 @@
 # screens they show are drawn by port/gfx/screens.c, which the port_gfx target builds. Their tests are here too, with
 # those of check_exit.py, the checker of the tests of the program's endings.
 target_sources(port_app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app/present.c" "${CMAKE_CURRENT_SOURCE_DIR}/app/gamepad.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/app/message_log.c" "${CMAKE_CURRENT_SOURCE_DIR}/app/replay.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/app/message_log.c" "${CMAKE_CURRENT_SOURCE_DIR}/app/record.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/app/replay.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/app/run_dir.c" "${CMAKE_CURRENT_SOURCE_DIR}/app/sound_trace.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/oracle/pbwinput.c")
 # The version an input file's "version" line must name
@@ -89,6 +90,58 @@ foreach(variant IN ITEMS plain sanitized)
         target_link_options(${target} PRIVATE -fsanitize=address,undefined)
     endif()
     add_test(NAME app_run_dir_${variant} COMMAND ${target})
+endforeach()
+
+# Recordings (port/app/record.c, --record), plain and under the sanitizers, with the input file reader that reads them
+# back and the platform layer's record of the random seeds (port/tests/app/test_record.c): the header, a line a change
+# and a pen down for one VBlank kept, the state at power-on, the file after each sample as a killed run leaves it, a
+# write that fails partway, a file that exists or can't be made, and a file removed for a run that never starts. Then
+# the stop when the game asks for a seed past the declared ones, which ends the program with status 1
+foreach(variant IN ITEMS plain sanitized)
+    set(target port_test_record_${variant})
+    add_executable(${target} "${CMAKE_CURRENT_SOURCE_DIR}/tests/app/test_record.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/app/record.c" "${CMAKE_CURRENT_SOURCE_DIR}/tools/oracle/pbwinput.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/hal/gfl/random_seed.c" ${port_host_sources})
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_options(${target} PRIVATE -std=c11 -Wall -Wextra -Werror)
+    if(variant STREQUAL "sanitized")
+        target_compile_options(${target} PRIVATE
+            -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+    add_test(NAME app_record_${variant} COMMAND ${target})
+    set_tests_properties(app_record_${variant} PROPERTIES TIMEOUT 60)
+    add_test(NAME app_record_seeds_exhausted_${variant}
+        COMMAND "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1 "${PORT_PYTHON}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/app/check_exit.py" --status 1
+            --expect "asked for random seed 3, past the 2 the recording declares" --reject "reached the game"
+            -- $<TARGET_FILE:${target}> exhausted)
+    set_tests_properties(app_record_seeds_exhausted_${variant} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --record's option errors, before the game starts, so without the player's ROM too (status 2): the input file it
+# replays named as the recording, which it never overwrites (first_save's, which declares its seeds); a directory that
+# doesn't exist; and an input file without seeds, whose game would build its own
+set(app_record_seeded_input "${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle/first_save_${PORT_VERSION}.pbwinput")
+set(app_record_missing "${CMAKE_CURRENT_BINARY_DIR}/app_record_no_such_dir/recording.pbwinput")
+foreach(case IN ITEMS exists missing no_seeds)
+    if(case STREQUAL "exists")
+        set(arguments --input "${app_record_seeded_input}" --record "${app_record_seeded_input}")
+        set(expected "the file exists; a recording never overwrites a file")
+    elseif(case STREQUAL "missing")
+        set(arguments --record "${app_record_missing}")
+        set(expected "can't create it")
+    else()
+        set(arguments --input "${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle/title_${PORT_VERSION}.pbwinput"
+            --record "${app_record_missing}")
+        set(expected "declares no seeds")
+    endif()
+    add_test(NAME app_record_refuses_${case}
+        COMMAND "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1 "${PORT_PYTHON}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/app/check_exit.py" --status 2 --expect "${expected}"
+            --reject "entering the game's main" --fresh-save-dir
+            -- $<TARGET_FILE:${PORT_PROGRAM}> --headless --frames 1 ${arguments})
+    set_tests_properties(app_record_refuses_${case} PROPERTIES TIMEOUT 60)
 endforeach()
 
 # The gamepads (port/app/gamepad.c), plain and under the sanitizers: the mapping, the stick's dead zone and the pad that
@@ -212,6 +265,48 @@ add_test(NAME replay_same_save
         --input "${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle/first_save_${PORT_VERSION}.pbwinput")
 set_tests_properties(replay_same_save PROPERTIES SKIP_RETURN_CODE 66 TIMEOUT 1200)
 port_test_labels(replay_same_save route)
+
+# Recordings replay as the runs they record (T3, issue #38; port/tools/oracle/README.md, "Recordings"):
+# check_record.py records a run with --record, replays the recording with --input, and holds the replay to the run,
+# frame by frame (frames.tsv's hashes and counts), by run.txt's clock and seeds and by the save files, then records the
+# replay and holds that recording to the first. Each run starts from an empty save directory:
+#   first_save     first_save_<version>.pbwinput's start, on video frames with the DS's seed, through New Game, whose
+#                  formatting of the blank backup writes the save; the pen on the bottom screen and its release
+#   title          the title sequence's presses on game frames, recorded on video frames, with the DS's start-up seed
+#                  added and --fixed-time given to the recorded run only, so the replay's clock is the recording's
+#   title_pinned   the same with the clock pinned, at the format's default time
+#   live           no input: the clock at the host's time, and 64 seeds drawn from the host
+# Without the player's ROM the program exits 66 and the tests are skipped
+if(PORT_VERSION STREQUAL "b2_us")
+    set(replay_record_seed 0xea56a175a2fffc8a)
+    set(replay_record_pinned_seed 0x5a0af77416c50a14)
+else()
+    set(replay_record_seed 0x81d63ca2c9f3143e)
+    set(replay_record_pinned_seed 0x270fd5258c56ebe3)
+endif()
+set(replay_record_title_input "${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle/title_${PORT_VERSION}.pbwinput")
+set(replay_record_first_save --input "${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle/first_save_${PORT_VERSION}.pbwinput"
+    --save --frames 5600)
+set(replay_record_title --input "${replay_record_title_input}" --header "seed ${replay_record_seed}"
+    --fixed-time "2015-03-04 05:06:07" --expect "time 2015-03-04 05:06:07" --expect "clock running" --frames 3300)
+set(replay_record_title_pinned --input "${replay_record_title_input}" --header "clock pinned"
+    --header "seed ${replay_record_pinned_seed}" --expect "time 2012-10-07 12:00:00" --expect "clock pinned"
+    --frames 3300)
+set(replay_record_live --expect "clock running" --seeds 64 --frames 1200)
+foreach(route IN ITEMS first_save title title_pinned live)
+    # --frames goes to the program, after the checker's own options
+    set(options ${replay_record_${route}})
+    list(FIND options --frames at)
+    list(SUBLIST options 0 ${at} checker)
+    math(EXPR at "${at} + 1")
+    list(GET options ${at} frames)
+    add_test(NAME replay_record_${route}
+        COMMAND "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1 "${PORT_PYTHON}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/check_record.py" ${checker} --
+            $<TARGET_FILE:${PORT_PROGRAM}> --headless --frames ${frames} --watchdog 30)
+    set_tests_properties(replay_record_${route} PROPERTIES SKIP_RETURN_CODE 66 TIMEOUT 1200)
+    port_test_labels(replay_record_${route} route)
+endforeach()
 
 # The starter's route on the port, held to the oracle's save of it (T3, T6): first_save_<version>.pbwinput from a blank
 # save to the field menu's SAVE (the adventure's first save, made on the port as replay_same_save and oracle.py

@@ -18,11 +18,12 @@ set_source_files_properties(
 # The tests: each scenario runs the decomp's ARM9 libraries (pm.c, tp.c, nvram.c, os_reset.c, ctrdg.c, the SND
 # commands and NitroSystem's sound players) against the host's ARM7, as the game's main() would, on the whole
 # program's objects, with a main() of their own. One scenario a process, so that the libraries' one-time starts
-# (PM_Init and the like) begin from nothing in each
+# (PM_Init and the like) begin from nothing in each. tp_recorded_vblanks also records the touch with the program's
+# recorder and reads it back with the input file reader (port/app/record.c, port/tools/oracle/pbwinput.c)
 enable_testing()
 add_executable(port_pxi_tests
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/pxi/test_pxi.c"
-    $<TARGET_OBJECTS:pokebw2_game> $<TARGET_OBJECTS:port_hal> ${port_gfx_objects} "${PORT_GEN}/stubs.c")
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/pxi/test_pxi.c" "${CMAKE_CURRENT_SOURCE_DIR}/app/record.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/oracle/pbwinput.c" $<TARGET_OBJECTS:pokebw2_game> $<TARGET_OBJECTS:port_hal> ${port_gfx_objects} "${PORT_GEN}/stubs.c")
 target_link_libraries(port_pxi_tests PRIVATE port_decomp_env SDL3::SDL3)
 target_include_directories(port_pxi_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_options(port_pxi_tests PRIVATE -std=gnu11 -Wall -Wextra -Wno-unused-parameter)
@@ -33,7 +34,7 @@ endif()
 set(port_pxi_scenarios
     bus_ready_tags bus_unknown_tag bus_reply_when_enabled bus_pointer
     pm_battery_backlight pm_amp pm_sleep pm_power_off
-    tp_sampling tp_calibration tp_auto_sampling
+    tp_sampling tp_calibration tp_auto_sampling tp_recorded_vblanks
     nvram_user_info nvram_read nvram_write
     rtc_fixed_time rtc_runs_with_clock rtc_pinned rtc_async rtc_host_time
     reset_command ctrdg_empty mic_silence
